@@ -1,0 +1,60 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  # Application logs (Rails, Puma)
+  - job_name: app
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: rails
+          __path__: /var/log/app/production.log
+
+  # Sidekiq logs
+  - job_name: sidekiq
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: sidekiq
+          __path__: /var/log/app/sidekiq.log
+
+  # Nginx access logs
+  - job_name: nginx-access
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: nginx
+          type: access
+          __path__: /var/log/nginx/access.log
+
+  # Nginx error logs
+  - job_name: nginx-error
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: nginx
+          type: error
+          __path__: /var/log/nginx/error.log
+
+  # systemd journal (Puma + Sidekiq service logs)
+  - job_name: journal
+    journal:
+      json: false
+      max_age: 12h
+      path: /var/log/journal
+      labels:
+        job: systemd
+    relabel_configs:
+      - source_labels: ["__journal__systemd_unit"]
+        target_label: unit

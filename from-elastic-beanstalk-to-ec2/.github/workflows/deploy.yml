@@ -1,0 +1,149 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  S3_BUCKET: my-deployments
+  S3_KEY: deployments/myapp/deploy.tar.gz
+  ASG_NAME: my-app-asg
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: myapp_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "2.6.6"
+          bundler-cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: yarn
+
+      - run: yarn install --frozen-lockfile
+
+      - name: Setup Database
+        env:
+          DATABASE_URL: postgres://test:test@localhost:5432/myapp_test
+          RAILS_ENV: test
+        run: bundle exec rake db:schema:load
+
+      - name: Run Tests
+        env:
+          DATABASE_URL: postgres://test:test@localhost:5432/myapp_test
+          REDIS_URL: redis://localhost:6379/0
+          RAILS_ENV: test
+        run: bundle exec rspec
+
+  build-and-deploy:
+    name: Build and Deploy
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build and Upload Artifact to S3
+        env:
+          S3_BUCKET: ${{ env.S3_BUCKET }}
+          S3_KEY: ${{ env.S3_KEY }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          echo "Creating deployment tarball..."
+          tar czf /tmp/deploy.tar.gz \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='tmp/*' \
+            --exclude='log/*' \
+            --exclude='spec' \
+            --exclude='test' \
+            --exclude='.ebextensions' \
+            --exclude='.elasticbeanstalk' \
+            .
+
+          echo "Uploading to S3..."
+          aws s3 cp /tmp/deploy.tar.gz "s3://${S3_BUCKET}/${S3_KEY}"
+
+          # Versioned copy for rollback
+          VERSIONED_KEY="${S3_KEY%.tar.gz}-$(date +%Y%m%d%H%M%S)-${GITHUB_SHA::7}.tar.gz"
+          aws s3 cp /tmp/deploy.tar.gz "s3://${S3_BUCKET}/${VERSIONED_KEY}"
+          echo "Versioned artifact: ${VERSIONED_KEY}"
+
+      - name: Upload Setup Scripts to S3
+        run: |
+          tar czf /tmp/setup-scripts.tar.gz -C infrastructure/setup-scripts .
+          aws s3 cp /tmp/setup-scripts.tar.gz \
+            "s3://${S3_BUCKET}/deployments/myapp/setup-scripts.tar.gz"
+
+      - name: Trigger ASG Instance Refresh
+        run: |
+          echo "Starting instance refresh on ${ASG_NAME}..."
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --preferences '{"MinHealthyPercentage":90,"InstanceWarmup":300}' \
+            --query 'InstanceRefreshId' \
+            --output text)
+
+          echo "Instance refresh started: ${REFRESH_ID}"
+
+          # Poll until complete
+          while true; do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query 'InstanceRefreshes[0].Status' \
+              --output text)
+
+            echo "Refresh status: ${STATUS}"
+
+            case "$STATUS" in
+              Successful) echo "Deployment complete."; break ;;
+              Failed|Cancelled|RollbackSuccessful|RollbackFailed)
+                echo "Deployment failed with status: ${STATUS}"
+                exit 1 ;;
+              *) sleep 30 ;;
+            esac
+          done

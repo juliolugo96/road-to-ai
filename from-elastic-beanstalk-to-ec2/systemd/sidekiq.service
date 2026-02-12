@@ -1,0 +1,43 @@
+[Unit]
+Description=Sidekiq Background Job Processor
+After=network.target redis.service
+Wants=redis.service
+
+[Service]
+Type=notify
+WatchdogSec=10
+User=webapp
+Group=webapp
+WorkingDirectory=/var/app/current
+EnvironmentFile=/etc/myapp/env
+Environment=RAILS_ENV=production
+Environment=RBENV_ROOT=/usr/local/rbenv
+Environment=PATH=/usr/local/rbenv/versions/2.6.6/bin:/usr/local/rbenv/bin:/usr/bin:/bin
+Environment=MALLOC_ARENA_MAX=2
+
+ExecStart=/usr/local/rbenv/versions/2.6.6/bin/bundle exec sidekiq -e production -C config/sidekiq.yml
+ExecReload=/bin/kill -TSTP $MAINPID
+
+Restart=on-failure
+RestartSec=5
+
+# Graceful shutdown: allow 25s for jobs to finish
+TimeoutStopSec=25
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sidekiq
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/app/current/tmp
+ReadWritePaths=/var/app/shared/tmp
+ReadWritePaths=/var/app/shared/log
+ReadWritePaths=/var/app/shared/storage
+
+[Install]
+WantedBy=multi-user.target
